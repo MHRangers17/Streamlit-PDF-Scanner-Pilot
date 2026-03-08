@@ -1,0 +1,8 @@
+streamlit
+pandas
+pdfplumber
+pypdf
+xlsxwriter
+pydantic
+rapidfuzz
+Pillow
