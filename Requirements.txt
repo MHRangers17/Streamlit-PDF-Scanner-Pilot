@@ -1,7 +1,7 @@
 streamlit
 pandas
 pdfplumber
-pytessaract
+pytesseract
 openpyxl
 pypdf
 xlsxwriter
