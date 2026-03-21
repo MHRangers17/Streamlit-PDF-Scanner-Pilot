@@ -1,6 +1,8 @@
 streamlit
 pandas
 pdfplumber
+pytessaract
+openpyxl
 pypdf
 xlsxwriter
 pydantic
