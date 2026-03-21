@@ -3,8 +3,6 @@ import io
 import streamlit as st
 import pandas as pd
 import pdfplumber
-import pytesseract
-from pdf2image import convert_from_bytes
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -49,14 +47,8 @@ def extract_from_pdf(pdf_file):
                         rows.append({**meta, "Text": line.strip()})
                 continue
 
-            # 3) OCR fallback for scanned pages
-            images = convert_from_bytes(
-                pdf_bytes, first_page=page_num, last_page=page_num
-            )
-            ocr_text = pytesseract.image_to_string(images[0])
-            for line in ocr_text.splitlines():
-                if line.strip():
-                    rows.append({**meta, "Text": line.strip()})
+            # 3) OCR fallback for scanned pages (requires Poppler — not yet enabled)
+            rows.append({**meta, "Text": "[Scanned page — OCR not available]"})
 
     return rows
 
