@@ -8,3 +8,4 @@ xlsxwriter
 pydantic
 rapidfuzz
 Pillow
+pdf2image
