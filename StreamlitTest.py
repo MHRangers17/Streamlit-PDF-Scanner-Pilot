@@ -119,3 +119,44 @@ if "result_excel_bytes" in st.session_state:
         file_name="extraction.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+# --- Analysis ---
+if "result_df" in st.session_state:
+    st.divider()
+    df = st.session_state["result_df"]
+
+    # Detect usable columns
+    state_col = next((c for c in df.columns if "state" in c.lower()), None)
+    numeric_cols = [c for c in df.select_dtypes(include="number").columns if c.lower() != "page"]
+    amount_col = numeric_cols[0] if numeric_cols else None
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Summarize Sales by State"):
+            if state_col and amount_col:
+                summary = (
+                    df.groupby(state_col)[amount_col]
+                    .sum()
+                    .reset_index()
+                    .rename(columns={state_col: "State", amount_col: "Total Sales"})
+                    .sort_values("Total Sales", ascending=False)
+                )
+                st.subheader("Sales by State")
+                st.dataframe(summary, use_container_width=True)
+            else:
+                missing = []
+                if not state_col:
+                    missing.append("a column containing 'state'")
+                if not amount_col:
+                    missing.append("a numeric amount column")
+                st.warning(f"Could not find {' or '.join(missing)}. Available columns: {list(df.columns)}")
+
+    with col2:
+        if st.button("Top 3 Largest Invoices"):
+            if amount_col:
+                top3 = df.nlargest(3, amount_col)
+                st.subheader("Top 3 Largest Invoices")
+                st.dataframe(top3, use_container_width=True)
+            else:
+                st.warning(f"Could not find a numeric amount column. Available columns: {list(df.columns)}")
