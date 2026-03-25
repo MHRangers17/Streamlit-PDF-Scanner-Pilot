@@ -1,22 +1,20 @@
 
 import io
+import os
+import base64
+import json
 import streamlit as st
 import pandas as pd
 import pdfplumber
 import pytesseract
+import anthropic
 from pdf2image import convert_from_bytes
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def extract_from_pdf(pdf_file):
-    """Return a list of row-dicts extracted from one PDF.
-
-    Strategy per page:
-      1. Tables found  → each data row becomes a dict with column headers.
-      2. Text found    → each non-empty line becomes a {"Text": …} row.
-      3. No text       → page is scanned; run Tesseract OCR then split lines.
-    """
+    """Python OCR extraction using pdfplumber + Tesseract fallback."""
     pdf_bytes = pdf_file.read()
     rows = []
 
@@ -39,7 +37,7 @@ def extract_from_pdf(pdf_file):
                         for header, value in zip(headers, data_row):
                             row[header] = value
                         rows.append(row)
-                continue  # done with this page
+                continue
 
             # 2) Plain-text extraction
             text = page.extract_text()
@@ -61,6 +59,59 @@ def extract_from_pdf(pdf_file):
     return rows
 
 
+def extract_with_claude(pdf_file):
+    """Send the PDF to Claude API and return structured invoice data as row-dicts."""
+    api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+    client = anthropic.Anthropic(api_key=api_key)
+
+    pdf_bytes = pdf_file.read()
+    b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=4096,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": b64,
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Extract all invoice or sales data from this document into a structured JSON array.\n"
+                        "Return ONLY a valid JSON array — no markdown, no explanation, no code fences.\n"
+                        "Each element should represent one line item or invoice record.\n"
+                        "Include every field you can identify, such as: Invoice Number, Date, Vendor, "
+                        "Customer, State, Amount, Quantity, Description, etc.\n"
+                        "Example: [{\"Invoice Number\": \"1001\", \"Date\": \"2024-01-15\", "
+                        "\"Amount\": 1500.00, \"State\": \"TX\"}]"
+                    )
+                }
+            ]
+        }]
+    )
+
+    raw = next((b.text for b in response.content if b.type == "text"), "[]").strip()
+
+    # Strip markdown code fences if Claude added them
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:])
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+
+    data = json.loads(raw)
+    for row in data:
+        row["Source"] = pdf_file.name
+    return data
+
+
 def build_excel(df: pd.DataFrame) -> bytes:
     """Serialize a DataFrame to an Excel file in memory and return raw bytes."""
     buffer = io.BytesIO()
@@ -80,7 +131,14 @@ if uploaded:
     st.success(f"{len(uploaded)} file(s) ready.")
     st.session_state["pdfs"] = uploaded
 
-process_clicked = st.button("Run OCR + Extract")
+# Extraction method selector
+method = st.radio(
+    "Extraction method",
+    ["Claude AI (recommended)", "Python OCR (pdfplumber)"],
+    horizontal=True,
+)
+
+process_clicked = st.button("Run Extract")
 
 if process_clicked:
     pdfs = st.session_state.get("pdfs", [])
@@ -88,11 +146,15 @@ if process_clicked:
         st.warning("Please upload at least one PDF first.")
     else:
         all_rows = []
-        with st.spinner("Processing…"):
+        use_claude = method.startswith("Claude")
+        with st.spinner("Processing with Claude AI…" if use_claude else "Processing with Python OCR…"):
             for pdf_file in pdfs:
                 pdf_file.seek(0)
                 try:
-                    rows = extract_from_pdf(pdf_file)
+                    if use_claude:
+                        rows = extract_with_claude(pdf_file)
+                    else:
+                        rows = extract_from_pdf(pdf_file)
                     all_rows.extend(rows)
                 except Exception as e:
                     st.error(f"Error processing {pdf_file.name}: {e}")
@@ -101,9 +163,7 @@ if process_clicked:
             df = pd.DataFrame(all_rows)
             st.session_state["result_df"] = df
             st.session_state["result_excel_bytes"] = build_excel(df)
-            st.success(
-                f"Extracted {len(df)} rows from {len(pdfs)} file(s)."
-            )
+            st.success(f"Extracted {len(df)} rows from {len(pdfs)} file(s).")
         else:
             st.error("No data could be extracted from the uploaded file(s).")
 
