@@ -4,6 +4,11 @@ __pycache__/
 .venv/
 venv/
 
+# Environment variables (API keys, secrets)
+.env
+.env.local
+.env.*.local
+
 # Streamlit secrets (do not commit)
 .streamlit/secrets.toml
 
