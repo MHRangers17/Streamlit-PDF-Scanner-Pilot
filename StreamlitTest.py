@@ -8,7 +8,36 @@ import pandas as pd
 import pdfplumber
 import pytesseract
 import anthropic
+import plotly.express as px
 from pdf2image import convert_from_bytes
+
+
+# ── State name → 2-letter abbreviation lookup ────────────────────────────────
+
+STATE_ABBREVS = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+
+def normalize_state(value: str) -> str:
+    """Return a 2-letter state code; pass through values already 2 chars."""
+    if not isinstance(value, str):
+        return value
+    v = value.strip()
+    if len(v) == 2:
+        return v.upper()
+    return STATE_ABBREVS.get(v.lower(), v)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -22,7 +51,6 @@ def extract_from_pdf(pdf_file):
         for page_num, page in enumerate(pdf.pages, start=1):
             meta = {"Source": pdf_file.name, "Page": page_num}
 
-            # 1) Table extraction
             tables = page.extract_tables()
             if tables:
                 for table in tables:
@@ -39,7 +67,6 @@ def extract_from_pdf(pdf_file):
                         rows.append(row)
                 continue
 
-            # 2) Plain-text extraction
             text = page.extract_text()
             if text and text.strip():
                 for line in text.splitlines():
@@ -47,7 +74,6 @@ def extract_from_pdf(pdf_file):
                         rows.append({**meta, "Text": line.strip()})
                 continue
 
-            # 3) OCR fallback for scanned pages
             images = convert_from_bytes(
                 pdf_bytes, first_page=page_num, last_page=page_num
             )
@@ -99,7 +125,6 @@ def extract_with_claude(pdf_file):
 
     raw = next((b.text for b in response.content if b.type == "text"), "[]").strip()
 
-    # Strip markdown code fences if Claude added them
     if raw.startswith("```"):
         lines = raw.splitlines()
         raw = "\n".join(lines[1:])
@@ -131,7 +156,6 @@ if uploaded:
     st.success(f"{len(uploaded)} file(s) ready.")
     st.session_state["pdfs"] = uploaded
 
-# Extraction method selector
 method = st.radio(
     "Extraction method",
     ["Claude AI (recommended)", "Python OCR (pdfplumber)"],
@@ -180,12 +204,12 @@ if "result_excel_bytes" in st.session_state:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# --- Analysis ---
+# ── Analysis buttons ──────────────────────────────────────────────────────────
+
 if "result_df" in st.session_state:
     st.divider()
     df = st.session_state["result_df"]
 
-    # Detect usable columns
     state_col = next((c for c in df.columns if "state" in c.lower()), None)
     numeric_cols = [c for c in df.select_dtypes(include="number").columns if c.lower() != "page"]
     amount_col = numeric_cols[0] if numeric_cols else None
@@ -220,3 +244,75 @@ if "result_df" in st.session_state:
                 st.dataframe(top3, use_container_width=True)
             else:
                 st.warning(f"Could not find a numeric amount column. Available columns: {list(df.columns)}")
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+if "result_df" in st.session_state:
+    st.divider()
+    st.header("Dashboard")
+
+    df = st.session_state["result_df"]
+    state_col = next((c for c in df.columns if "state" in c.lower()), None)
+    numeric_cols = [c for c in df.select_dtypes(include="number").columns if c.lower() != "page"]
+    amount_col = numeric_cols[0] if numeric_cols else None
+
+    if not state_col or not amount_col:
+        missing = []
+        if not state_col:
+            missing.append("state")
+        if not amount_col:
+            missing.append("numeric amount")
+        st.info(f"Dashboard requires a {' and '.join(missing)} column. Available columns: {list(df.columns)}")
+    else:
+        # Build summary by jurisdiction
+        summary = (
+            df.groupby(state_col)[amount_col]
+            .sum()
+            .reset_index()
+            .rename(columns={state_col: "Jurisdiction", amount_col: "Total Amount"})
+            .sort_values("Total Amount", ascending=False)
+        )
+        summary["State Code"] = summary["Jurisdiction"].apply(normalize_state)
+
+        # ── Pie chart ─────────────────────────────────────────────────────────
+        st.subheader("Invoice Amount by Jurisdiction")
+        pie = px.pie(
+            summary,
+            names="Jurisdiction",
+            values="Total Amount",
+            hole=0.35,
+            color_discrete_sequence=px.colors.qualitative.Plotly,
+        )
+        pie.update_traces(textposition="inside", textinfo="percent+label")
+        pie.update_layout(showlegend=True, margin=dict(t=30, b=0, l=0, r=0))
+        st.plotly_chart(pie, use_container_width=True)
+
+        # ── US Choropleth map ──────────────────────────────────────────────────
+        st.subheader("Invoice Amount by US State")
+
+        # Only keep rows that resolved to a valid 2-letter code
+        map_data = summary[summary["State Code"].str.len() == 2].copy()
+
+        if map_data.empty:
+            st.info(
+                "No valid US state codes found. "
+                "Make sure the state column contains US state names or abbreviations."
+            )
+        else:
+            choro = px.choropleth(
+                map_data,
+                locations="State Code",
+                locationmode="USA-states",
+                color="Total Amount",
+                scope="usa",
+                color_continuous_scale="Blues",
+                hover_name="Jurisdiction",
+                hover_data={"Total Amount": ":,.2f", "State Code": False},
+                labels={"Total Amount": "Invoice Total ($)"},
+            )
+            choro.update_layout(
+                geo=dict(showlakes=True, lakecolor="lightblue"),
+                margin=dict(t=30, b=0, l=0, r=0),
+                coloraxis_colorbar=dict(title="Invoice Total ($)"),
+            )
+            st.plotly_chart(choro, use_container_width=True)
