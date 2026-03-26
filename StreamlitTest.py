@@ -145,6 +145,64 @@ def build_excel(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def run_quality_check(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Scan df for data quality issues and return a flagged subset.
+
+    Checks:
+      - Missing / blank values in non-metadata columns
+      - Numeric outliers via IQR (values beyond Q1-1.5*IQR or Q3+1.5*IQR)
+      - Negative values in amount-like columns
+
+    Returns a copy of the flagged rows with an 'Issues' column prepended.
+    """
+    skip_cols = {"source", "page"}
+    check_cols = [c for c in df.columns if c.lower() not in skip_cols]
+    numeric_cols = [
+        c for c in df.select_dtypes(include="number").columns
+        if c.lower() not in skip_cols
+    ]
+
+    issues: dict[int, list[str]] = {}
+
+    # Missing / blank values
+    for col in check_cols:
+        for idx, val in df[col].items():
+            is_missing = pd.isna(val) or (isinstance(val, str) and val.strip() == "")
+            if is_missing:
+                issues.setdefault(idx, []).append(f"Missing: {col}")
+
+    # Outliers and negatives in numeric columns
+    for col in numeric_cols:
+        series = df[col].dropna()
+        if len(series) >= 4:
+            q1, q3 = series.quantile(0.25), series.quantile(0.75)
+            iqr = q3 - q1
+            lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        else:
+            lower, upper = None, None
+
+        for idx, val in df[col].items():
+            if pd.isna(val):
+                continue
+            if val < 0:
+                issues.setdefault(idx, []).append(f"Negative value: {col} = {val:,.2f}")
+            elif lower is not None:
+                if val < lower or val > upper:
+                    direction = "high" if val > upper else "low"
+                    issues.setdefault(idx, []).append(
+                        f"Outlier ({direction}): {col} = {val:,.2f}"
+                    )
+
+    if not issues:
+        return pd.DataFrame()
+
+    flagged = df.loc[sorted(issues.keys())].copy()
+    flagged.insert(0, "⚠ Issues", ["; ".join(v) for v in
+                                    [issues[i] for i in sorted(issues.keys())]])
+    return flagged
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("PDF Extractor")
@@ -191,11 +249,11 @@ if process_clicked:
         else:
             st.error("No data could be extracted from the uploaded file(s).")
 
-# Show table preview
+# ── Raw data table ────────────────────────────────────────────────────────────
+
 if "result_df" in st.session_state:
     st.dataframe(st.session_state["result_df"], use_container_width=True)
 
-# Download button
 if "result_excel_bytes" in st.session_state:
     st.download_button(
         "Download Excel",
@@ -203,6 +261,56 @@ if "result_excel_bytes" in st.session_state:
         file_name="extraction.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+# ── Data Quality Review ───────────────────────────────────────────────────────
+
+if "result_df" in st.session_state:
+    st.divider()
+    st.header("Data Quality Review")
+
+    df = st.session_state["result_df"]
+    flagged = run_quality_check(df)
+
+    total = len(df)
+    n_flagged = len(flagged)
+    n_clean = total - n_flagged
+
+    # Summary metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Rows", total)
+    m2.metric("Rows with Issues", n_flagged, delta=f"{n_flagged/total*100:.0f}%" if total else "0%",
+              delta_color="inverse")
+    m3.metric("Clean Rows", n_clean)
+
+    if flagged.empty:
+        st.success("No data quality issues detected.")
+    else:
+        st.warning(f"{n_flagged} row(s) flagged. Review and correct below, then click **Apply Corrections**.")
+
+        # Show flagged-only view (read-only, colour-coded)
+        with st.expander("Flagged rows — details", expanded=True):
+            st.dataframe(
+                flagged,
+                use_container_width=True,
+                column_config={"⚠ Issues": st.column_config.TextColumn(width="large")},
+            )
+
+    # Editable full table — users can fix any cell
+    st.subheader("Edit Data")
+    st.caption("Correct any values below, then click **Apply Corrections** to update the dataset.")
+
+    edited_df = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="data_editor",
+    )
+
+    if st.button("Apply Corrections"):
+        st.session_state["result_df"] = edited_df
+        st.session_state["result_excel_bytes"] = build_excel(edited_df)
+        st.success("Dataset updated. Download or run analysis using the corrected data.")
+        st.rerun()
 
 # ── Analysis buttons ──────────────────────────────────────────────────────────
 
@@ -264,7 +372,6 @@ if "result_df" in st.session_state:
             missing.append("numeric amount")
         st.info(f"Dashboard requires a {' and '.join(missing)} column. Available columns: {list(df.columns)}")
     else:
-        # Build summary by jurisdiction
         summary = (
             df.groupby(state_col)[amount_col]
             .sum()
@@ -274,7 +381,7 @@ if "result_df" in st.session_state:
         )
         summary["State Code"] = summary["Jurisdiction"].apply(normalize_state)
 
-        # ── Pie chart ─────────────────────────────────────────────────────────
+        # Pie chart
         st.subheader("Invoice Amount by Jurisdiction")
         pie = px.pie(
             summary,
@@ -287,10 +394,8 @@ if "result_df" in st.session_state:
         pie.update_layout(showlegend=True, margin=dict(t=30, b=0, l=0, r=0))
         st.plotly_chart(pie, use_container_width=True)
 
-        # ── US Choropleth map ──────────────────────────────────────────────────
+        # US choropleth map
         st.subheader("Invoice Amount by US State")
-
-        # Only keep rows that resolved to a valid 2-letter code
         map_data = summary[summary["State Code"].str.len() == 2].copy()
 
         if map_data.empty:
