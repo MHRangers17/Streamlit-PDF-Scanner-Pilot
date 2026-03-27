@@ -415,19 +415,19 @@ if "result_df" in st.session_state:
     df = st.session_state["result_df"]
 
     state_col = next((c for c in df.columns if "state" in c.lower()), None)
-    numeric_cols = [c for c in df.select_dtypes(include="number").columns if c.lower() != "page"]
-    amount_col = numeric_cols[0] if numeric_cols else None
+    total_per_txn_col = "total_per_transaction" if "total_per_transaction" in df.columns else None
+    invoice_col = next((c for c in df.columns if "invoice" in c.lower()), None)
 
     col1, col2 = st.columns(2)
 
     with col1:
         if st.button("Summarize Sales by State"):
-            if state_col and amount_col:
+            if state_col and total_per_txn_col:
                 summary = (
-                    df.groupby(state_col)[amount_col]
+                    df.groupby(state_col)[total_per_txn_col]
                     .sum()
                     .reset_index()
-                    .rename(columns={state_col: "State", amount_col: "Total Sales"})
+                    .rename(columns={state_col: "State", total_per_txn_col: "Total Sales"})
                     .sort_values("Total Sales", ascending=False)
                 )
                 st.subheader("Sales by State")
@@ -436,18 +436,29 @@ if "result_df" in st.session_state:
                 missing = []
                 if not state_col:
                     missing.append("a column containing 'state'")
-                if not amount_col:
-                    missing.append("a numeric amount column")
+                if not total_per_txn_col:
+                    missing.append("'total_per_transaction'")
                 st.warning(f"Could not find {' or '.join(missing)}. Available columns: {list(df.columns)}")
 
     with col2:
         if st.button("Top 3 Largest Invoices"):
-            if amount_col:
-                top3 = df.nlargest(3, amount_col)
+            if invoice_col and total_per_txn_col:
+                top3 = (
+                    df.groupby(invoice_col)[total_per_txn_col]
+                    .sum()
+                    .reset_index()
+                    .rename(columns={invoice_col: "Invoice", total_per_txn_col: "Total Sales"})
+                    .nlargest(3, "Total Sales")
+                )
                 st.subheader("Top 3 Largest Invoices")
                 st.dataframe(top3, use_container_width=True)
             else:
-                st.warning(f"Could not find a numeric amount column. Available columns: {list(df.columns)}")
+                missing = []
+                if not invoice_col:
+                    missing.append("an invoice number column")
+                if not total_per_txn_col:
+                    missing.append("'total_per_transaction'")
+                st.warning(f"Could not find {' or '.join(missing)}. Available columns: {list(df.columns)}")
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
@@ -457,10 +468,7 @@ if "result_df" in st.session_state:
 
     df = st.session_state["result_df"]
     state_col = next((c for c in df.columns if "state" in c.lower()), None)
-    tax_col = next(
-        (c for c in df.columns if "sales tax" in c.lower() or "tax" in c.lower()),
-        None,
-    )
+    tax_col = "sales_tax_per_transaction" if "sales_tax_per_transaction" in df.columns else None
 
     if not state_col or not tax_col:
         missing = []
