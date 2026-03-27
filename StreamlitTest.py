@@ -10,6 +10,7 @@ import pytesseract
 import anthropic
 import plotly.express as px
 from pdf2image import convert_from_bytes
+from invoice_agent import run_invoice_agent
 
 
 # ── State name → 2-letter abbreviation lookup ────────────────────────────────
@@ -137,6 +138,79 @@ def extract_with_claude(pdf_file):
     return data
 
 
+def normalize_column_names_with_claude(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Uses Claude to identify and merge duplicate/synonym columns (e.g. 'vendor' vs 'vendor name').
+    Returns the cleaned DataFrame and a list of merges that were applied for display.
+    """
+    api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+    client = anthropic.Anthropic(api_key=api_key)
+
+    columns = list(df.columns)
+    sample = df.head(5).to_dict(orient="records")
+
+    prompt = f"""You are a data normalization assistant. I have a DataFrame compiled from OCR-extracted invoices.
+Different invoices used different field names for the same data, causing duplicate columns.
+
+Current columns: {columns}
+
+Sample rows (first 5):
+{json.dumps(sample, indent=2, default=str)}
+
+Task: Identify groups of columns that represent the same field (synonyms/variants).
+Return ONLY a JSON object like this — no explanation, no markdown:
+{{
+  "merges": [
+    {{
+      "canonical": "the best column name to keep",
+      "duplicates": ["list", "of", "other", "column", "names", "to", "merge", "in"]
+    }}
+  ]
+}}
+
+Rules:
+- Only include columns that are genuine synonyms (same data, different label)
+- "canonical" should be the clearest, most descriptive name
+- "duplicates" should be merged INTO the canonical column (fill nulls)
+- If no merges are needed, return {{"merges": []}}
+"""
+
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.splitlines()[1:])
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+
+    result = json.loads(raw)
+    applied = []
+
+    for merge in result.get("merges", []):
+        canonical = merge["canonical"]
+        duplicates = [d for d in merge["duplicates"] if d in df.columns]
+
+        if not duplicates:
+            continue
+
+        if canonical not in df.columns:
+            df = df.rename(columns={duplicates[0]: canonical})
+            duplicates = duplicates[1:]
+
+        for dup in duplicates:
+            if dup in df.columns:
+                df[canonical] = df[canonical].combine_first(df[dup])
+                df = df.drop(columns=[dup])
+
+        applied.append(merge)
+
+    return df, applied
+
+
 def build_excel(df: pd.DataFrame) -> bytes:
     """Serialize a DataFrame to an Excel file in memory and return raw bytes."""
     buffer = io.BytesIO()
@@ -234,7 +308,8 @@ if process_clicked:
                 pdf_file.seek(0)
                 try:
                     if use_claude:
-                        rows = extract_with_claude(pdf_file)
+                        api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+                        rows = run_invoice_agent(pdf_file.read(), filename=pdf_file.name, api_key=api_key)
                     else:
                         rows = extract_from_pdf(pdf_file)
                     all_rows.extend(rows)
@@ -243,11 +318,32 @@ if process_clicked:
 
         if all_rows:
             df = pd.DataFrame(all_rows)
+
+            # Normalize synonym columns when using Claude extraction
+            if use_claude:
+                with st.spinner("Normalizing column names…"):
+                    try:
+                        df, merges = normalize_column_names_with_claude(df)
+                        st.session_state["column_merges"] = merges
+                    except Exception as e:
+                        st.warning(f"Column normalization skipped: {e}")
+                        st.session_state["column_merges"] = []
+            else:
+                st.session_state["column_merges"] = []
+
             st.session_state["result_df"] = df
             st.session_state["result_excel_bytes"] = build_excel(df)
             st.success(f"Extracted {len(df)} rows from {len(pdfs)} file(s).")
         else:
             st.error("No data could be extracted from the uploaded file(s).")
+
+# ── Column merge report ───────────────────────────────────────────────────────
+
+if st.session_state.get("column_merges"):
+    with st.expander(f"Column normalization applied — {len(st.session_state['column_merges'])} merge(s)", expanded=False):
+        for m in st.session_state["column_merges"]:
+            dups = ", ".join(f'`{d}`' for d in m["duplicates"])
+            st.markdown(f"- Merged {dups} → **`{m['canonical']}`**")
 
 # ── Raw data table ────────────────────────────────────────────────────────────
 
@@ -361,32 +457,37 @@ if "result_df" in st.session_state:
 
     df = st.session_state["result_df"]
     state_col = next((c for c in df.columns if "state" in c.lower()), None)
-    numeric_cols = [c for c in df.select_dtypes(include="number").columns if c.lower() != "page"]
-    amount_col = numeric_cols[0] if numeric_cols else None
+    tax_col = next(
+        (c for c in df.columns if "sales tax" in c.lower() or "tax" in c.lower()),
+        None,
+    )
 
-    if not state_col or not amount_col:
+    if not state_col or not tax_col:
         missing = []
         if not state_col:
             missing.append("state")
-        if not amount_col:
-            missing.append("numeric amount")
-        st.info(f"Dashboard requires a {' and '.join(missing)} column. Available columns: {list(df.columns)}")
+        if not tax_col:
+            missing.append("sales tax")
+        st.info(
+            f"Dashboard requires a {' and '.join(missing)} column. "
+            f"Available columns: {list(df.columns)}"
+        )
     else:
         summary = (
-            df.groupby(state_col)[amount_col]
+            df.groupby(state_col)[tax_col]
             .sum()
             .reset_index()
-            .rename(columns={state_col: "Jurisdiction", amount_col: "Total Amount"})
-            .sort_values("Total Amount", ascending=False)
+            .rename(columns={state_col: "Jurisdiction", tax_col: "Sales Tax"})
+            .sort_values("Sales Tax", ascending=False)
         )
         summary["State Code"] = summary["Jurisdiction"].apply(normalize_state)
 
         # Pie chart
-        st.subheader("Invoice Amount by Jurisdiction")
+        st.subheader("Sales Tax by Jurisdiction")
         pie = px.pie(
             summary,
             names="Jurisdiction",
-            values="Total Amount",
+            values="Sales Tax",
             hole=0.35,
             color_discrete_sequence=px.colors.qualitative.Plotly,
         )
@@ -395,7 +496,7 @@ if "result_df" in st.session_state:
         st.plotly_chart(pie, use_container_width=True)
 
         # US choropleth map
-        st.subheader("Invoice Amount by US State")
+        st.subheader("Sales Tax by US State")
         map_data = summary[summary["State Code"].str.len() == 2].copy()
 
         if map_data.empty:
@@ -408,16 +509,16 @@ if "result_df" in st.session_state:
                 map_data,
                 locations="State Code",
                 locationmode="USA-states",
-                color="Total Amount",
+                color="Sales Tax",
                 scope="usa",
-                color_continuous_scale="Blues",
+                color_continuous_scale="Oranges",
                 hover_name="Jurisdiction",
-                hover_data={"Total Amount": ":,.2f", "State Code": False},
-                labels={"Total Amount": "Invoice Total ($)"},
+                hover_data={"Sales Tax": ":,.2f", "State Code": False},
+                labels={"Sales Tax": "Sales Tax ($)"},
             )
             choro.update_layout(
                 geo=dict(showlakes=True, lakecolor="lightblue"),
                 margin=dict(t=30, b=0, l=0, r=0),
-                coloraxis_colorbar=dict(title="Invoice Total ($)"),
+                coloraxis_colorbar=dict(title="Sales Tax ($)"),
             )
             st.plotly_chart(choro, use_container_width=True)
