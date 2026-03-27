@@ -35,7 +35,10 @@ Extraction rules:
 - Strip currency symbols from amounts; return numeric values only
 - Dates should use ISO format (YYYY-MM-DD) where possible
 - State values should be recorded exactly as they appear in the document
-- Sales tax should be the dollar amount, not the rate, unless only the rate is available
+- sales_tax on the invoice represents the total tax for the entire invoice, not per line item
+- total on the invoice represents the total amount for the entire invoice, not per line item
+- sales_tax_rate should be extracted if available (e.g. 0.08 for 8%)
+- Do not populate sales_tax or total per line item; those fields reflect invoice-level totals only
 """
 
 
@@ -103,10 +106,6 @@ INVOICE_TOOL = {
                         "state": {
                             "type": ["string", "null"],
                             "description": "US state where the transaction occurred",
-                        },
-                        "po_number": {
-                            "type": ["string", "null"],
-                            "description": "Purchase order number if present",
                         },
                         "payment_terms": {
                             "type": ["string", "null"],
@@ -202,6 +201,15 @@ def run_invoice_agent(
             records = block.input.get("records", [])
             for record in records:
                 record["Source"] = filename
+                amount = record.get("amount")
+                rate = record.get("sales_tax_rate")
+                if amount is not None and rate is not None:
+                    tax_per = round(amount * rate, 2)
+                    record["sales_tax_per_transaction"] = tax_per
+                    record["total_per_transaction"] = round(amount + tax_per, 2)
+                else:
+                    record["sales_tax_per_transaction"] = None
+                    record["total_per_transaction"] = None
             return records
 
     raise ValueError(
